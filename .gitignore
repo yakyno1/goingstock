@@ -1,0 +1,35 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Secrets
+xueqiu_cookie.txt
+eastmoney_cookie.txt
+*.cookie
+*cookie*.txt
+*token*.txt
+*secret*.txt
+
+# Outputs / generated data
+outputs*/
+*_BAK_*/
+pages_backup_before_restore_*/
+_disabled_duplicate_pages/
+
+# Exported data
+*.csv
+!watchlist_xueqiu.csv
+*.xlsx
+*.json
+*.zip
+*.rar
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
