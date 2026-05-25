@@ -24,6 +24,7 @@ from fundflow_rebuild_clean_core import (
     build_repair_commands,
     run_commands,
     clean_root,
+    fetch_stock_fund_flow_em,
 )
 
 st.set_page_config(page_title="行业概念资金流", layout="wide")
@@ -252,6 +253,62 @@ with tab4:
 5. 复制 Request Headers 里的 Cookie；
 6. 保存后点击测试，确认 `ok=true` 且 `rows>0`。
 """)
+
+    st.divider()
+    st.subheader("东财个股资金流最小测试（自填股票）")
+    c1, c2, c3 = st.columns([1.2, 1.0, 1.0])
+    with c1:
+        stock_input = st.text_input("股票代码", value="601138", help="支持 6 位代码，如 601138")
+    with c2:
+        market_label = st.selectbox("市场", ["自动", "沪市(sh)", "深市(sz)", "北交所(bj)"], index=0)
+    with c3:
+        retry_n = st.number_input("重试次数", min_value=1, max_value=5, value=2, step=1)
+
+    use_range = st.checkbox("附带 beg/end 参数（有时不稳定）", value=False)
+    market_map = {"自动": "", "沪市(sh)": "sh", "深市(sz)": "sz", "北交所(bj)": "bj"}
+
+    if st.button("测试东财个股资金流", type="primary", use_container_width=True):
+        req_start = start_s if use_range else ""
+        req_end = end_s if use_range else ""
+        with st.spinner("正在抓取东财个股资金流..."):
+            df_stock, meta = fetch_stock_fund_flow_em(
+                PROJECT_ROOT,
+                stock=stock_input,
+                market=market_map.get(market_label, ""),
+                start=req_start,
+                end=req_end,
+                retries=int(retry_n),
+            )
+
+        meta_view = {k: v for k, v in meta.items() if k != "attempts"}
+        if meta.get("ok"):
+            st.success(
+                f"抓取成功：{meta.get('stock', '')}，{meta.get('rows', 0)} 行，"
+                f"{meta.get('min_date', '')} ~ {meta.get('max_date', '')}"
+            )
+            st.caption(f"保存路径：{meta.get('saved', '')}")
+            st.markdown("#### 个股资金流明细（中文）")
+            show_cols = [
+                "日期",
+                "收盘价",
+                "涨跌幅",
+                "主力净流入(亿元)",
+                "主力净流入净占比",
+                "超大单净流入(亿元)",
+                "大单净流入(亿元)",
+                "中单净流入(亿元)",
+                "小单净流入(亿元)",
+            ]
+            keep_cols = [c for c in show_cols if c in df_stock.columns]
+            st.dataframe(df_stock[keep_cols] if keep_cols else df_stock, use_container_width=True, height=360)
+        else:
+            st.error(f"抓取失败：{meta.get('error', '未知错误')}")
+
+        st.json(meta_view)
+        attempts = pd.DataFrame(meta.get("attempts", []))
+        if not attempts.empty:
+            st.markdown("#### 请求尝试明细")
+            st.dataframe(attempts, use_container_width=True, height=220)
 
 with tab5:
     cache = load_cache(PROJECT_ROOT)

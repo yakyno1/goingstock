@@ -902,6 +902,290 @@ def test_cookie_request(project_root: str | Path) -> Dict[str, object]:
         return {"ok": False, "error": repr(e)}
 
 
+def _normalize_stock_code(stock: str) -> str:
+    s = re.sub(r"\D", "", str(stock or "").strip())
+    return s[-6:] if len(s) >= 6 else s
+
+
+def _normalize_market(stock: str, market: str = "") -> str:
+    m = str(market or "").strip().lower()
+    if m in {"sh", "sz", "bj"}:
+        return m
+    if stock.startswith(("4", "8")):
+        return "bj"
+    if stock.startswith(("0", "2", "3")):
+        return "sz"
+    return "sh"
+
+
+def fetch_stock_fund_flow_em(
+    project_root: str | Path,
+    stock: str,
+    market: str = "",
+    start: str = "",
+    end: str = "",
+    retries: int = 2,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    """
+    东方财富个股资金流最小抓取（优先 no_beg_end，必要时再尝试带 beg/end）。
+    返回: (明细DataFrame, 元信息dict)
+    """
+    try:
+        import requests
+    except Exception as e:
+        return pd.DataFrame(), {"ok": False, "error": f"requests未安装：{e}", "stock": stock}
+
+    code = _normalize_stock_code(stock)
+    if len(code) != 6:
+        return pd.DataFrame(), {"ok": False, "error": f"股票代码无效：{stock}", "stock": stock}
+
+    market_norm = _normalize_market(code, market)
+    market_no = {"sh": "1", "sz": "0", "bj": "0"}[market_norm]
+    cookie_text = read_cookie(project_root)
+    retries = max(1, int(retries))
+
+    base_params = {
+        "lmt": "0",
+        "klt": "101",
+        "secid": f"{market_no}.{code}",
+        "fields1": "f1,f2,f3,f7",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+        "ut": "b2884a393a59ad64002292a3e90d46a5",
+    }
+    variants: List[Tuple[str, Dict[str, str]]] = [("no_beg_end", dict(base_params))]
+
+    start_key = compact_date(start) if str(start).strip() else ""
+    end_key = compact_date(end) if str(end).strip() else ""
+    if start_key or end_key:
+        p = dict(base_params)
+        if start_key:
+            p["beg"] = start_key
+        if end_key:
+            p["end"] = end_key
+        variants.append(("with_beg_end", p))
+
+    urls = ["https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"]
+
+    attempts: List[Dict[str, object]] = []
+    last_error = ""
+
+    for mode, params_base in variants:
+        for url in urls:
+            for attempt in range(1, retries + 1):
+                params = dict(params_base)
+                params["_"] = str(int(time.time() * 1000))
+                try:
+                    session = requests.Session()
+                    session.trust_env = False
+                    headers = {
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/125.0.0.0 Safari/537.36"
+                        ),
+                        "Accept": "application/json,text/plain,*/*",
+                        "Referer": "https://data.eastmoney.com/zjlx/detail.html",
+                        "Connection": "keep-alive",
+                    }
+                    if cookie_text:
+                        headers["Cookie"] = cookie_text
+
+                    r = session.get(url, params=params, headers=headers, timeout=20)
+                    status = int(r.status_code)
+                    try:
+                        js = r.json()
+                    except Exception as e:
+                        err = f"json_error: {repr(e)}"
+                        attempts.append(
+                            {
+                                "mode": mode,
+                                "url": url,
+                                "attempt": attempt,
+                                "ok": False,
+                                "status_code": status,
+                                "error": err,
+                            }
+                        )
+                        last_error = err
+                        continue
+
+                    klines = ((js.get("data") or {}).get("klines") or []) if isinstance(js, dict) else []
+                    if status != 200 or not klines:
+                        msg = ""
+                        if isinstance(js, dict):
+                            msg = str(js.get("message") or js.get("msg") or "")
+                        err = f"status={status}; rows={len(klines)}; msg={msg}"
+                        attempts.append(
+                            {
+                                "mode": mode,
+                                "url": url,
+                                "attempt": attempt,
+                                "ok": False,
+                                "status_code": status,
+                                "error": err,
+                            }
+                        )
+                        last_error = err
+                        continue
+
+                    rows = [str(x).split(",") for x in klines]
+                    df = pd.DataFrame(rows)
+                    cols = [
+                        "日期",
+                        "主力净流入",
+                        "小单净流入",
+                        "中单净流入",
+                        "大单净流入",
+                        "超大单净流入",
+                        "主力净流入净占比",
+                        "小单净流入净占比",
+                        "中单净流入净占比",
+                        "大单净流入净占比",
+                        "超大单净流入净占比",
+                        "收盘价",
+                        "涨跌幅",
+                        "扩展1",
+                        "扩展2",
+                    ]
+                    if df.shape[1] < 13:
+                        err = f"字段数异常：{df.shape[1]}"
+                        attempts.append(
+                            {
+                                "mode": mode,
+                                "url": url,
+                                "attempt": attempt,
+                                "ok": False,
+                                "status_code": status,
+                                "error": err,
+                            }
+                        )
+                        last_error = err
+                        continue
+
+                    df = df.iloc[:, : min(df.shape[1], len(cols))].copy()
+                    df.columns = cols[: df.shape[1]]
+                    if "日期" in df.columns:
+                        df["日期"] = pd.to_datetime(df["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+                    for c in df.columns:
+                        if c != "日期":
+                            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+                    for c in ["主力净流入", "小单净流入", "中单净流入", "大单净流入", "超大单净流入"]:
+                        if c in df.columns:
+                            df[f"{c}(亿元)"] = df[c] / 1e8
+
+                    if "日期" in df.columns:
+                        df = df.sort_values("日期").reset_index(drop=True)
+
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    save_path = clean_root(project_root) / "logs" / f"stock_fundflow_em_{code}_{mode}_{ts}.csv"
+                    df.to_csv(save_path, index=False, encoding="utf-8-sig")
+
+                    min_date = str(df["日期"].min()) if ("日期" in df.columns and not df.empty) else ""
+                    max_date = str(df["日期"].max()) if ("日期" in df.columns and not df.empty) else ""
+                    attempts.append(
+                        {
+                            "mode": mode,
+                            "url": url,
+                            "attempt": attempt,
+                            "ok": True,
+                            "status_code": status,
+                            "error": "",
+                        }
+                    )
+
+                    return df, {
+                        "ok": True,
+                        "stock": code,
+                        "market": market_norm,
+                        "mode": mode,
+                        "url": url,
+                        "rows": int(len(df)),
+                        "min_date": min_date,
+                        "max_date": max_date,
+                        "saved": save_path.as_posix(),
+                        "attempts": attempts,
+                    }
+                except Exception as e:
+                    err = repr(e)
+                    attempts.append(
+                        {
+                            "mode": mode,
+                            "url": url,
+                            "attempt": attempt,
+                            "ok": False,
+                            "status_code": 0,
+                            "error": err,
+                        }
+                    )
+                    last_error = err
+                    time.sleep(min(1.2, 0.25 * attempt))
+
+    # 回退：实时抓取失败时，尝试读取最近一次本地成功文件，避免页面空白。
+    logs_dir = clean_root(project_root) / "logs"
+    fallback_files = sorted(logs_dir.glob(f"stock_fundflow_em_{code}_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not fallback_files:
+        fallback_files = sorted(
+            logs_dir.glob(f"min_test_stock_{code}_em_detail_*.csv"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    if fallback_files:
+        p = fallback_files[0]
+        df = read_csv_safe(p)
+        if not df.empty:
+            rename_map = {
+                "date": "日期",
+                "main_net_inflow": "主力净流入",
+                "small_net_inflow": "小单净流入",
+                "medium_net_inflow": "中单净流入",
+                "big_net_inflow": "大单净流入",
+                "super_big_net_inflow": "超大单净流入",
+                "main_net_ratio": "主力净流入净占比",
+                "small_net_ratio": "小单净流入净占比",
+                "medium_net_ratio": "中单净流入净占比",
+                "big_net_ratio": "大单净流入净占比",
+                "super_big_net_ratio": "超大单净流入净占比",
+                "close": "收盘价",
+                "change_pct": "涨跌幅",
+            }
+            df = df.rename(columns=rename_map)
+            if "日期" in df.columns:
+                df["日期"] = pd.to_datetime(df["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+            for c in df.columns:
+                if c != "日期":
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            for c in ["主力净流入", "小单净流入", "中单净流入", "大单净流入", "超大单净流入"]:
+                if c in df.columns and f"{c}(亿元)" not in df.columns:
+                    df[f"{c}(亿元)"] = pd.to_numeric(df[c], errors="coerce") / 1e8
+            if "日期" in df.columns:
+                df = df.sort_values("日期").reset_index(drop=True)
+
+            return df, {
+                "ok": True,
+                "stock": code,
+                "market": market_norm,
+                "mode": "cache_fallback",
+                "url": "",
+                "rows": int(len(df)),
+                "min_date": str(df["日期"].min()) if "日期" in df.columns and not df.empty else "",
+                "max_date": str(df["日期"].max()) if "日期" in df.columns and not df.empty else "",
+                "saved": p.as_posix(),
+                "error": last_error or "",
+                "attempts": attempts,
+            }
+
+    return pd.DataFrame(), {
+        "ok": False,
+        "stock": code,
+        "market": market_norm,
+        "rows": 0,
+        "error": last_error or "抓取失败",
+        "attempts": attempts,
+    }
+
+
 def python_exe(project_root: str | Path) -> str:
     p = Path(project_root).resolve() / ".venv" / "Scripts" / "python.exe"
     return p.as_posix() if p.exists() else sys.executable
