@@ -184,7 +184,14 @@ def fetch_rank(session: requests.Session, board_type: str, pz: int) -> Tuple[pd.
     return df, logs
 
 
-def fetch_board_history(session: requests.Session, board_type: str, board_code: str, board_name: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def fetch_board_history(
+    session: requests.Session,
+    board_type: str,
+    board_code: str,
+    board_name: str,
+    start: str = "",
+    end: str = "",
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     urls = [
         "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
         "https://push2his.eastmoney.com/weblogin/api/qt/stock/fflow/daykline/get",
@@ -198,56 +205,81 @@ def fetch_board_history(session: requests.Session, board_type: str, board_code: 
         "ut": "b2884a393a59ad64002292a3e90d46a5",
         "_": str(int(time.time() * 1000)),
     }
+    # Some accounts/environments return only recent rows without explicit window.
+    # Pass beg/end to request the full target range when supported.
+    s = str(start).replace("-", "").strip()
+    e = str(end).replace("-", "").strip()
+    if s:
+        params["beg"] = s
+    if e:
+        params["end"] = e
     referer = "https://data.eastmoney.com/bkzj/hy.html" if board_type == "industry" else "https://data.eastmoney.com/bkzj/gn.html"
+
+    param_variants: List[Dict[str, Any]] = []
+    # Variant A: explicit range (best when API honors beg/end)
+    param_variants.append(dict(params))
+    # Variant B: without range, often returns the latest ~120 days more stably
+    p2 = dict(params)
+    p2.pop("beg", None)
+    p2.pop("end", None)
+    p2["lmt"] = "120"
+    param_variants.append(p2)
 
     last_err = ""
     for url in urls:
-        js, err, status, raw = get_json_safe(session, url, params, referer)
-        if err:
-            last_err = err
-            continue
+        for pv in param_variants:
+            for attempt in range(2):
+                js, err, status, raw = get_json_safe(session, url, pv, referer)
+                if err:
+                    last_err = err
+                    # transient failures: short retry
+                    if attempt == 0 and ("ReadTimeout" in err or "ConnectionError" in err or "HTTP 5" in err):
+                        time.sleep(0.25)
+                        continue
+                    break
 
-        data = (js or {}).get("data") or {}
-        klines = data.get("klines") or []
-        if not klines:
-            last_err = "empty klines"
-            continue
+                data = (js or {}).get("data") or {}
+                klines = data.get("klines") or []
+                if not klines:
+                    last_err = "empty klines"
+                    break
 
-        rows = [str(x).split(",") for x in klines]
-        df = pd.DataFrame(rows)
-        cols = [
-            "date",
-            "main_net_inflow",
-            "small_net_inflow",
-            "medium_net_inflow",
-            "big_net_inflow",
-            "super_big_net_inflow",
-            "main_net_ratio",
-            "small_net_ratio",
-            "medium_net_ratio",
-            "big_net_ratio",
-            "super_big_net_ratio",
-            "close",
-            "change_pct",
-        ]
-        if df.shape[1] >= len(cols):
-            df = df.iloc[:, :len(cols)]
-            df.columns = cols
-        else:
-            return pd.DataFrame(), {"stage": "hist", "board_type": board_type, "api": "eastmoney_board_history", "status": "ERROR", "rows": 0, "error": f"字段数异常 {df.shape[1]}", "board_name": board_name}
+                rows = [str(x).split(",") for x in klines]
+                df = pd.DataFrame(rows)
+                cols = [
+                    "date",
+                    "main_net_inflow",
+                    "small_net_inflow",
+                    "medium_net_inflow",
+                    "big_net_inflow",
+                    "super_big_net_inflow",
+                    "main_net_ratio",
+                    "small_net_ratio",
+                    "medium_net_ratio",
+                    "big_net_ratio",
+                    "super_big_net_ratio",
+                    "close",
+                    "change_pct",
+                ]
+                if df.shape[1] >= len(cols):
+                    df = df.iloc[:, :len(cols)]
+                    df.columns = cols
+                else:
+                    last_err = f"字段数异常 {df.shape[1]}"
+                    break
 
-        for c in df.columns:
-            if c != "date":
-                df[c] = pd.to_numeric(df[c], errors="coerce")
+                for c in df.columns:
+                    if c != "date":
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        df["board_type"] = board_type
-        df["board_code"] = board_code
-        df["board_name"] = board_name
+                df["board_type"] = board_type
+                df["board_code"] = board_code
+                df["board_name"] = board_name
 
-        for c in ["main_net_inflow","small_net_inflow","medium_net_inflow","big_net_inflow","super_big_net_inflow"]:
-            df[c + "_yi"] = df[c] / 1e8
+                for c in ["main_net_inflow","small_net_inflow","medium_net_inflow","big_net_inflow","super_big_net_inflow"]:
+                    df[c + "_yi"] = df[c] / 1e8
 
-        return df, {"stage": "hist", "board_type": board_type, "api": "eastmoney_board_history", "status": "OK", "rows": len(df), "error": "", "board_name": board_name}
+                return df, {"stage": "hist", "board_type": board_type, "api": "eastmoney_board_history", "status": "OK", "rows": len(df), "error": "", "board_name": board_name}
 
     return pd.DataFrame(), {"stage": "hist", "board_type": board_type, "api": "eastmoney_board_history", "status": "ERROR", "rows": 0, "error": last_err, "board_name": board_name}
 
@@ -264,16 +296,22 @@ def filter_dates(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
 
 
 def make_top_bottom(all_df: pd.DataFrame, topn: int) -> pd.DataFrame:
+    cols = [
+        "date", "board_type", "rank_type", "rank",
+        "board_name", "board_code", "net_inflow_yi",
+        "change_pct", "close", "source_api",
+    ]
     rows = []
     if all_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=cols)
     for (bt, d), g in all_df.groupby(["board_type", "date"], dropna=False):
         g = g.dropna(subset=["main_net_inflow_yi"]).copy()
         if g.empty:
             continue
         g = g.sort_values("main_net_inflow_yi", ascending=False).drop_duplicates("board_name", keep="first")
-        top = g[g["main_net_inflow_yi"] > 0].sort_values("main_net_inflow_yi", ascending=False).head(topn)
-        bottom = g[g["main_net_inflow_yi"] < 0].sort_values("main_net_inflow_yi", ascending=True).head(topn)
+        # Always take top/bottom N by value. Requiring >0/<0 causes sparse days.
+        top = g.sort_values("main_net_inflow_yi", ascending=False).head(topn)
+        bottom = g.sort_values("main_net_inflow_yi", ascending=True).head(topn)
 
         for i, (_, r) in enumerate(top.iterrows(), 1):
             rows.append({
@@ -291,7 +329,9 @@ def make_top_bottom(all_df: pd.DataFrame, topn: int) -> pd.DataFrame:
                 "change_pct": r.get("change_pct"), "close": r.get("close"),
                 "source_api": "eastmoney_cookie_direct"
             })
-    return pd.DataFrame(rows)
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(rows, columns=cols)
 
 
 def cell_text(name: str, value: float) -> str:
@@ -299,6 +339,8 @@ def cell_text(name: str, value: float) -> str:
 
 
 def make_pivot(tb: pd.DataFrame, board_type: str, topn: int) -> pd.DataFrame:
+    if tb.empty or "board_type" not in tb.columns:
+        return pd.DataFrame()
     part = tb[tb["board_type"] == board_type].copy()
     if part.empty:
         return pd.DataFrame()
@@ -315,9 +357,9 @@ def make_pivot(tb: pd.DataFrame, board_type: str, topn: int) -> pd.DataFrame:
 
 
 def make_frequency(tb: pd.DataFrame, topn: int) -> pd.DataFrame:
-    rows = []
-    if tb.empty:
+    if tb.empty or "board_type" not in tb.columns:
         return pd.DataFrame()
+    rows = []
     for (bt, name), g in tb.groupby(["board_type", "board_name"], dropna=False):
         top3 = g[(g["rank_type"] == "top_inflow") & (g["rank"] <= 3)]
         bot3 = g[(g["rank_type"] == "bottom_outflow") & (g["rank"] <= 3)]
@@ -413,7 +455,7 @@ def main():
             code = str(r["board_code"])
             name = str(r["board_name"])
             print(f"[{bt}] {i}/{total} {name} {code}")
-            hist, log = fetch_board_history(session, bt, code, name)
+            hist, log = fetch_board_history(session, bt, code, name, start=args.start, end=args.end)
             log_rows.append(log)
             if not hist.empty:
                 hist2 = filter_dates(hist, args.start, args.end)

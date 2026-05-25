@@ -49,3 +49,4 @@ for name, path in [
     ("隔夜外部变量", ROOT/"outputs_overnight"/"reports"),
 ]:
     st.write(f"**{name}**：`{path}`")
+
