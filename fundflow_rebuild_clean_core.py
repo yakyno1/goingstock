@@ -787,30 +787,140 @@ def trend_data(cache: pd.DataFrame, start: str, end: str, kind: str, boards: Lis
 
 def export_current(project_root: str | Path, cache: pd.DataFrame, start: str, end: str, rank_n: int = 6, top_n: int = 3) -> Dict[str, str]:
     root = clean_root(project_root) / "exports"
+    latest_root = clean_root(project_root) / "latest"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    latest_root.mkdir(parents=True, exist_ok=True)
 
     sub = cache[(cache["date"] >= normalize_date(start)) & (cache["date"] <= normalize_date(end))].copy()
     long_path = root / f"fundflow_long_{normalize_date(start)}_{normalize_date(end)}_{ts}.csv"
     sub.to_csv(long_path, index=False, encoding="utf-8-sig")
+    long_latest = latest_root / "fundflow_long_latest.csv"
+    sub.to_csv(long_latest, index=False, encoding="utf-8-sig")
 
     miss = missing_table(cache, start, end, rank_n, project_root=project_root)
     miss_path = root / f"fundflow_missing_{normalize_date(start)}_{normalize_date(end)}_{ts}.csv"
     miss.to_csv(miss_path, index=False, encoding="utf-8-sig")
+    miss_latest = latest_root / "fundflow_missing_latest.csv"
+    miss.to_csv(miss_latest, index=False, encoding="utf-8-sig")
 
-    paths = {"long": long_path.as_posix(), "missing": miss_path.as_posix()}
+    paths = {
+        "long": long_path.as_posix(),
+        "missing": miss_path.as_posix(),
+        "latest_long": long_latest.as_posix(),
+        "latest_missing": miss_latest.as_posix(),
+    }
 
     for kind in ["concept", "industry"]:
         piv = build_pivot(cache, start, end, kind, rank_n)
         p = root / f"fundflow_pivot_{kind}_{normalize_date(start)}_{normalize_date(end)}_{ts}.csv"
         piv.to_csv(p, index=False, encoding="utf-8-sig")
         paths[f"pivot_{kind}"] = p.as_posix()
+        p_latest = latest_root / f"fundflow_pivot_{kind}_latest.csv"
+        piv.to_csv(p_latest, index=False, encoding="utf-8-sig")
+        paths[f"latest_pivot_{kind}"] = p_latest.as_posix()
 
         freq = frequency_stats(cache, start, end, kind, top_n)
         fp = root / f"fundflow_top{top_n}_frequency_{kind}_{normalize_date(start)}_{normalize_date(end)}_{ts}.csv"
         freq.to_csv(fp, index=False, encoding="utf-8-sig")
         paths[f"frequency_{kind}"] = fp.as_posix()
+        fp_latest = latest_root / f"fundflow_frequency_{kind}_latest.csv"
+        freq.to_csv(fp_latest, index=False, encoding="utf-8-sig")
+        paths[f"latest_frequency_{kind}"] = fp_latest.as_posix()
 
     return paths
+
+
+def latest_output_files(project_root: str | Path) -> pd.DataFrame:
+    """
+    返回关键输出目录的“最新文件索引”，方便快速打开，不再猜文件名。
+    """
+    root = Path(project_root).resolve()
+    clean = clean_root(root)
+    targets = [
+        ("latest", clean / "latest"),
+        ("exports", clean / "exports"),
+        ("logs", clean / "logs"),
+        ("cookie_normalized", root / "outputs_fundflow_cookie_clean" / "normalized"),
+        ("cookie_reports", root / "outputs_fundflow_cookie_clean" / "reports"),
+        ("cookie_logs", root / "outputs_fundflow_cookie_clean" / "logs"),
+    ]
+
+    rows: List[Dict[str, object]] = []
+    for label, d in targets:
+        if not d.exists():
+            continue
+        files = [p for p in d.iterdir() if p.is_file()]
+        if not files:
+            continue
+        files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+        for i, p in enumerate(files[:8], 1):
+            st_m = p.stat().st_mtime
+            rows.append(
+                {
+                    "目录": label,
+                    "序号": i,
+                    "文件名": p.name,
+                    "路径": p.as_posix(),
+                    "修改时间": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st_m)),
+                    "大小KB": round(p.stat().st_size / 1024, 1),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def cleanup_generated_outputs(project_root: str | Path, keep_latest: int = 20) -> Dict[str, object]:
+    """
+    清理历史时间戳文件，按目录各保留最近 N 个，降低文件杂乱度。
+    仅清理文件名包含 YYYYMMDD_HHMMSS 的生成物；latest 固定文件保留。
+    """
+    keep_latest = max(1, int(keep_latest))
+    root = Path(project_root).resolve()
+    clean = clean_root(root)
+    dirs = [
+        clean / "exports",
+        clean / "logs",
+        root / "outputs_fundflow_cookie_clean" / "raw",
+        root / "outputs_fundflow_cookie_clean" / "normalized",
+        root / "outputs_fundflow_cookie_clean" / "reports",
+        root / "outputs_fundflow_cookie_clean" / "logs",
+    ]
+
+    ts_pat = re.compile(r"\d{8}_\d{6}")
+    details: List[Dict[str, object]] = []
+    total_deleted = 0
+
+    for d in dirs:
+        if not d.exists():
+            continue
+        files = [p for p in d.iterdir() if p.is_file()]
+        generated = [p for p in files if ts_pat.search(p.name or "")]
+        generated = sorted(generated, key=lambda p: p.stat().st_mtime, reverse=True)
+        to_delete = generated[keep_latest:]
+        deleted = 0
+        for p in to_delete:
+            try:
+                p.unlink()
+                deleted += 1
+                total_deleted += 1
+            except Exception:
+                pass
+        details.append(
+            {
+                "目录": d.as_posix(),
+                "时间戳文件总数": len(generated),
+                "保留数量": min(len(generated), keep_latest),
+                "删除数量": deleted,
+            }
+        )
+
+    latest_df = latest_output_files(root)
+    return {
+        "ok": True,
+        "keep_latest": keep_latest,
+        "deleted_files": total_deleted,
+        "details": details,
+        "latest_count": int(len(latest_df)),
+    }
 
 
 # =========================

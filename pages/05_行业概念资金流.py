@@ -25,6 +25,8 @@ from fundflow_rebuild_clean_core import (
     run_commands,
     clean_root,
     fetch_stock_fund_flow_em,
+    latest_output_files,
+    cleanup_generated_outputs,
 )
 
 st.set_page_config(page_title="行业概念资金流", layout="wide")
@@ -152,6 +154,26 @@ with tab0:
                         st.warning(f"复检仍有缺失：{len(bad_after)} 条。可继续补采（会自动从未完成日期续跑）。")
                         st.dataframe(bad_after, use_container_width=True, height=260)
 
+    st.subheader("3. 输出文件管理（避免文件太多太乱）")
+    latest_df = latest_output_files(PROJECT_ROOT)
+    if latest_df.empty:
+        st.info("暂无可展示的最新输出文件。")
+    else:
+        st.caption("下表展示各目录最近文件，优先查看目录 `latest` 下的固定文件名。")
+        st.dataframe(latest_df, use_container_width=True, height=260)
+
+    c1, c2 = st.columns([1, 1.2])
+    with c1:
+        keep_n = st.number_input("每目录保留最近时间戳文件数", min_value=5, max_value=200, value=30, step=5)
+    with c2:
+        if st.button("整理历史输出文件（仅删旧时间戳文件）", use_container_width=True):
+            info = cleanup_generated_outputs(PROJECT_ROOT, keep_latest=int(keep_n))
+            st.success(f"整理完成：删除 {info.get('deleted_files', 0)} 个旧文件")
+            st.json(info)
+            latest_df2 = latest_output_files(PROJECT_ROOT)
+            if not latest_df2.empty:
+                st.dataframe(latest_df2, use_container_width=True, height=240)
+
 with tab1:
     cache = load_cache(PROJECT_ROOT)
     st.subheader("横向透视表")
@@ -256,20 +278,31 @@ with tab4:
 
     st.divider()
     st.subheader("东财个股资金流最小测试（自填股票）")
-    c1, c2, c3 = st.columns([1.2, 1.0, 1.0])
+    c1, c2, c3, c4 = st.columns([1.1, 1.0, 0.9, 1.0])
     with c1:
         stock_input = st.text_input("股票代码", value="601138", help="支持 6 位代码，如 601138")
     with c2:
         market_label = st.selectbox("市场", ["自动", "沪市(sh)", "深市(sz)", "北交所(bj)"], index=0)
     with c3:
         retry_n = st.number_input("重试次数", min_value=1, max_value=5, value=2, step=1)
+    with c4:
+        back_days = st.number_input("默认回看天数", min_value=5, max_value=240, value=30, step=5)
 
-    use_range = st.checkbox("附带 beg/end 参数（有时不稳定）", value=False)
+    s1, s2, s3 = st.columns([1, 1, 1.2])
+    with s1:
+        stock_start = st.date_input("个股开始日期", value=today - timedelta(days=int(back_days)))
+    with s2:
+        stock_end = st.date_input("个股结束日期", value=today)
+    with s3:
+        use_range = st.checkbox("向东财请求时附带 beg/end（偶发不稳定）", value=False)
+
+    stock_start_s = stock_start.strftime("%Y-%m-%d")
+    stock_end_s = stock_end.strftime("%Y-%m-%d")
     market_map = {"自动": "", "沪市(sh)": "sh", "深市(sz)": "sz", "北交所(bj)": "bj"}
 
     if st.button("测试东财个股资金流", type="primary", use_container_width=True):
-        req_start = start_s if use_range else ""
-        req_end = end_s if use_range else ""
+        req_start = stock_start_s if use_range else ""
+        req_end = stock_end_s if use_range else ""
         with st.spinner("正在抓取东财个股资金流..."):
             df_stock, meta = fetch_stock_fund_flow_em(
                 PROJECT_ROOT,
@@ -282,12 +315,21 @@ with tab4:
 
         meta_view = {k: v for k, v in meta.items() if k != "attempts"}
         if meta.get("ok"):
-            st.success(
-                f"抓取成功：{meta.get('stock', '')}，{meta.get('rows', 0)} 行，"
-                f"{meta.get('min_date', '')} ~ {meta.get('max_date', '')}"
-            )
-            st.caption(f"保存路径：{meta.get('saved', '')}")
-            st.markdown("#### 个股资金流明细（中文）")
+            df_show = df_stock.copy()
+            if "日期" in df_show.columns:
+                ds = pd.to_datetime(df_show["日期"], errors="coerce")
+                mask = (ds >= pd.to_datetime(stock_start_s)) & (ds <= pd.to_datetime(stock_end_s))
+                df_show = df_show[mask].copy()
+
+            if not df_show.empty and "日期" in df_show.columns:
+                st.success(
+                    f"抓取成功：{meta.get('stock', '')}，筛选后 {len(df_show)} 行，"
+                    f"{df_show['日期'].min()} ~ {df_show['日期'].max()}"
+                )
+            else:
+                st.warning(f"抓取成功但当前时间范围无数据：{stock_start_s} ~ {stock_end_s}")
+            st.caption(f"来源文件：{meta.get('saved', '')}")
+            st.markdown("#### 个股资金流明细（中文表头）")
             show_cols = [
                 "日期",
                 "收盘价",
@@ -299,8 +341,11 @@ with tab4:
                 "中单净流入(亿元)",
                 "小单净流入(亿元)",
             ]
-            keep_cols = [c for c in show_cols if c in df_stock.columns]
-            st.dataframe(df_stock[keep_cols] if keep_cols else df_stock, use_container_width=True, height=360)
+            keep_cols = [c for c in show_cols if c in df_show.columns]
+            st.dataframe(df_show[keep_cols] if keep_cols else df_show, use_container_width=True, height=360)
+            meta_view["筛选开始"] = stock_start_s
+            meta_view["筛选结束"] = stock_end_s
+            meta_view["筛选后行数"] = int(len(df_show))
         else:
             st.error(f"抓取失败：{meta.get('error', '未知错误')}")
 
